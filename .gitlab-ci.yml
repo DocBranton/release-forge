@@ -1,0 +1,56 @@
+# Release Forge's own pipeline. It includes its own scan template, so Release Forge can oversee itself.
+include:
+  - local: ci/release-forge.gitlab-ci.yml
+
+stages: [build, test, deploy]
+
+default:
+  interruptible: true
+
+.node:
+  image: node:22.22.0-slim
+  cache:
+    key: { files: [package-lock.json] }
+    paths: [.npm/]
+  before_script:
+    - npm ci --cache .npm --prefer-offline --no-audit --no-fund
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+
+build:
+  extends: .node
+  stage: build
+  script:
+    - npm run typecheck
+    - npm run build
+
+test:
+  extends: .node
+  stage: test
+  needs: []
+  script:
+    - npm test
+    - npm audit --omit=dev --audit-level=high
+
+# Manual deploy from the default branch. Uncomment rf-gate once Release Forge is registered as an application in itself.
+# rf-gate:
+#   extends: .rf-gate-oidc
+#   stage: deploy
+deploy:
+  stage: deploy
+  image: node:22.22.0-slim
+  needs: [build, test]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  script:
+    - Z=databricks_cli_${RF_DATABRICKS_CLI_VERSION}_linux_amd64.tar.gz
+    - node -e "fetch('https://github.com/databricks/cli/releases/download/v'+process.env.RF_DATABRICKS_CLI_VERSION+'/'+process.argv[1]).then(async r=>{if(!r.ok)throw new Error(r.status);require('fs').writeFileSync(process.argv[1],Buffer.from(await r.arrayBuffer()))})" "$Z"
+    - echo "$RF_DATABRICKS_CLI_SHA256  $Z" | sha256sum -c -
+    - tar -xzf "$Z" databricks
+    - ./databricks bundle deploy -t prod
+    - ./databricks bundle run release_forge -t prod

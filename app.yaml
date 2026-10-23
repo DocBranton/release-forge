@@ -1,0 +1,23 @@
+# Databricks App runtime configuration. Deployment runs `npm install` and `npm run build`, then this command.
+command: ["npm", "run", "start"]
+env:
+  # Lakebase: all Release Forge data (schema release_forge). PGHOST etc. are injected by the postgres resource.
+  - name: LAKEBASE_ENDPOINT
+    valueFrom: postgres
+  # GitLab personal/project/group access token with read_api, from a Databricks secret (app resource `gitlab-token`).
+  - name: GITLAB_TOKEN
+    valueFrom: gitlab-token
+  # The one GitLab host Release Forge polls. Registered applications are project paths on this host.
+  - name: GITLAB_URL
+    value: "https://gitlab.com"
+  # Comma-separated emails of Release Forge admins (register applications, change policy). Required.
+  - name: APP_ADMINS
+    value: ""
+  # Comma-separated service principal application ids allowed to record deployments. Empty = any signed-in principal.
+  - name: RF_GATE_PRINCIPALS
+    value: ""
+  - name: RF_POLL_SECONDS
+    value: "300"
+  # Classification marking shown in the footer banner, e.g. "CUI". Leave empty to hide.
+  - name: RF_CLASSIFICATION
+    value: ""

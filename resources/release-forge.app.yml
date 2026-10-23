@@ -1,0 +1,17 @@
+resources:
+  apps:
+    release_forge:
+      name: release-forge
+      description: Release Forge - software release assurance and governance for GitLab applications
+      source_code_path: ..
+      resources:
+        - name: postgres
+          postgres:
+            branch: ${var.postgres_branch}
+            database: ${var.postgres_database}
+            permission: CAN_CONNECT_AND_CREATE
+        - name: gitlab-token
+          secret:
+            scope: ${var.gitlab_secret_scope}
+            key: ${var.gitlab_secret_key}
+            permission: READ

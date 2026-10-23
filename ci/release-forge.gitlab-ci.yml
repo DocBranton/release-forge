@@ -1,0 +1,163 @@
+# Release Forge CI template. Include it from an application repository:
+#
+#   include:
+#     - project: "<group>/release-forge"   # this repository's GitLab mirror
+#       ref: v0.1.0                        # pin a tag
+#       file: "ci/release-forge.gitlab-ci.yml"
+#
+#   rf-gate:                     # blocks deployment until Release Forge approves this commit
+#     extends: .rf-gate-oidc     # or .rf-gate with RF_SP_CLIENT_SECRET
+#     stage: deploy
+#   deploy:
+#     stage: deploy
+#     needs: [rf-gate]
+#     script:
+#       - ./your-deploy-steps.sh
+#       - !reference [.rf-scripts, record_deploy]   # tells Release Forge this commit is deployed
+#
+# CI/CD variables (Settings > CI/CD > Variables, masked and protected):
+#   RF_APP_URL          Release Forge app URL, e.g. https://release-forge-123.aws.databricksapps.com
+#   DATABRICKS_HOST     Workspace URL that hosts Release Forge
+#   RF_SP_CLIENT_ID     Application id of the service principal that calls the gate (CAN_USE on the app)
+#   RF_OIDC_AUDIENCE    Audience of the Databricks federation policy for this GitLab project (preferred), or
+#   RF_SP_CLIENT_SECRET OAuth secret for that service principal (fallback when federation is not set up)
+#
+# Scanner jobs run in the .pre stage on default-branch pushes and tags, never on schedules or merge
+# requests. They never fail the pipeline themselves: Release Forge reads their artifacts and decides.
+# Images are pinned to released versions; pin them by digest from your approved registry if you can.
+
+variables:
+  RF_SEMGREP_IMAGE: "semgrep/semgrep:1.182.1"
+  RF_SEMGREP_CONFIG: "--config p/default --config p/owasp-top-ten"
+  RF_GITLEAKS_IMAGE: "zricethezav/gitleaks:v8.28.0"
+  RF_NODE_IMAGE: "node:22.22.0-slim"
+  RF_CHECKOV_IMAGE: "bridgecrew/checkov:3.3.30"
+  RF_CLAMAV_IMAGE: "clamav/clamav-debian:1.4.6"
+  RF_DATABRICKS_CLI_VERSION: "0.299.2"
+  RF_DATABRICKS_CLI_SHA256: "9b781b9b0939e8de77460652cd3405db1a0c4ff71cf93a849323cede8ec99a14"  # linux_amd64.tar.gz, from the release SHA256SUMS
+  RF_BUNDLE_TARGET: ""
+
+.rf-scan:
+  stage: .pre
+  needs: []
+  interruptible: true
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - mkdir -p release-forge
+  artifacts:
+    when: always
+    expire_in: 90 days
+    paths: [release-forge/]
+
+rf-semgrep:
+  extends: .rf-scan
+  image: { name: $RF_SEMGREP_IMAGE, entrypoint: [""] }
+  variables: { SEMGREP_SEND_METRICS: "off" }
+  script:
+    - semgrep scan $RF_SEMGREP_CONFIG --json --output release-forge/semgrep.json --metrics=off "$CI_PROJECT_DIR" || true
+
+rf-gitleaks:
+  extends: .rf-scan
+  image: { name: $RF_GITLEAKS_IMAGE, entrypoint: [""] }
+  variables: { GIT_DEPTH: "0" }   # full history
+  script:
+    - gitleaks git --report-format json --report-path release-forge/gitleaks.json --exit-code 0 --redact "$CI_PROJECT_DIR"
+
+rf-npm-audit:
+  extends: .rf-scan
+  image: $RF_NODE_IMAGE
+  script:
+    - |
+      if [ -f package-lock.json ]; then
+        npm audit --json > release-forge/npm-audit.json || true
+      else
+        echo '{"rf_skipped":"No package-lock.json in the repository root."}' > release-forge/npm-audit.json
+      fi
+
+rf-checkov:
+  extends: .rf-scan
+  image: { name: $RF_CHECKOV_IMAGE, entrypoint: [""] }
+  script:
+    - CFG=""; [ -f .checkov.yaml ] && CFG="--config-file .checkov.yaml"
+    - checkov -d . $CFG -o json --soft-fail --quiet --skip-path node_modules > release-forge/checkov.json || true
+
+rf-clamav:
+  extends: .rf-scan
+  image: { name: $RF_CLAMAV_IMAGE, entrypoint: [""] }
+  script:
+    - freshclam --stdout || echo "freshclam failed; scanning with the image's signatures"
+    - clamscan -r --infected --exclude-dir=.git --exclude-dir=node_modules . > release-forge/clamav.txt || true
+
+rf-bundle:
+  extends: .rf-scan
+  image: $RF_NODE_IMAGE
+  script:
+    - |
+      if [ ! -f databricks.yml ]; then echo "RF_SKIPPED: No databricks.yml in the repository root." > release-forge/bundle.txt; exit 0; fi
+      if [ -z "${DATABRICKS_HOST:-}" ]; then echo "RF_SKIPPED: DATABRICKS_HOST is not set for this project." > release-forge/bundle.txt; exit 0; fi
+      Z=databricks_cli_${RF_DATABRICKS_CLI_VERSION}_linux_amd64.tar.gz
+      node -e "fetch('https://github.com/databricks/cli/releases/download/v'+process.env.RF_DATABRICKS_CLI_VERSION+'/'+process.argv[1]).then(async r=>{if(!r.ok)throw new Error(r.status);require('fs').writeFileSync(process.argv[1],Buffer.from(await r.arrayBuffer()))})" "$Z"
+      echo "$RF_DATABRICKS_CLI_SHA256  $Z" | sha256sum -c -
+      tar -xzf "$Z" databricks
+      { ./databricks bundle validate ${RF_BUNDLE_TARGET:+-t $RF_BUNDLE_TARGET} 2>&1; echo "RF_EXIT=$?"; } > release-forge/bundle.txt
+      cat release-forge/bundle.txt
+
+# ---------- shared scripts ----------
+.rf-scripts:
+  # Prints a Databricks OAuth token for the gate's service principal to stdout.
+  token:
+    - |
+      RF_TOKEN=$(node -e "
+        const h=process.env.DATABRICKS_HOST.replace(/\/$/,''), id=process.env.RF_SP_CLIENT_ID, jwt=process.env.RF_ID_TOKEN, sec=process.env.RF_SP_CLIENT_SECRET;
+        const body = jwt
+          ? new URLSearchParams({grant_type:'urn:ietf:params:oauth:grant-type:token-exchange', subject_token:jwt, subject_token_type:'urn:ietf:params:oauth:token-type:jwt', client_id:id, scope:'all-apis'})
+          : new URLSearchParams({grant_type:'client_credentials', scope:'all-apis'});
+        const headers = {'content-type':'application/x-www-form-urlencoded'};
+        if(!jwt){ if(!sec){console.error('Set RF_OIDC_AUDIENCE (federation) or RF_SP_CLIENT_SECRET.');process.exit(2);} headers.authorization='Basic '+Buffer.from(id+':'+sec).toString('base64'); }
+        fetch(h+'/oidc/v1/token',{method:'POST',headers,body}).then(async r=>{ if(!r.ok){console.error('Databricks token request failed: '+r.status);process.exit(2);} console.log((await r.json()).access_token); });
+      ")
+      export RF_TOKEN
+  record_deploy:
+    - !reference [.rf-scripts, token]
+    - |
+      node -e "
+        fetch(process.env.RF_APP_URL.replace(/\/$/,'')+'/api/gate/deployed',{method:'POST',headers:{authorization:'Bearer '+process.env.RF_TOKEN,'content-type':'application/json'},
+          body:JSON.stringify({project:process.env.CI_PROJECT_PATH, sha:process.env.CI_COMMIT_SHA, environment:process.env.CI_ENVIRONMENT_NAME||'production'})})
+        .then(async r=>{ const t=await r.text(); console.log('Release Forge:', r.status, t); if(!r.ok) process.exit(1); });
+      "
+
+# Hidden jobs: extend one in the deploy stage and make your deploy job need it.
+# .rf-gate-oidc uses Databricks workload identity federation (no stored secret); .rf-gate uses RF_SP_CLIENT_SECRET.
+.rf-gate:
+  image: $RF_NODE_IMAGE
+  interruptible: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_TAG || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - !reference [.rf-scripts, token]
+    - |
+      node -e "
+        fetch(process.env.RF_APP_URL.replace(/\/$/,'')+'/api/gate/check',{method:'POST',headers:{authorization:'Bearer '+process.env.RF_TOKEN,'content-type':'application/json'},
+          body:JSON.stringify({project:process.env.CI_PROJECT_PATH, sha:process.env.CI_COMMIT_SHA, pipelineId:Number(process.env.CI_PIPELINE_ID)})})
+        .then(async r=>{
+          const t=await r.text(); let d; try{d=JSON.parse(t)}catch{console.error('Release Forge returned '+r.status+': '+t.slice(0,300));process.exit(1)}
+          if(!r.ok){console.error('Release Forge: '+(d.error||r.status));process.exit(1)}
+          console.log('Release Forge: '+(d.release ? 'release '+d.release : 'this commit')+' is '+String(d.status).replace('_',' ')+(d.url?' ('+d.url+')':''));
+          for(const x of d.reasons||[]) console.log('  - '+x);
+          if(!d.allowed){console.error('Deployment blocked until the release is approved in Release Forge. Re-run this job after sign-off.');process.exit(1)}
+          console.log('Approved: deployment may proceed.');
+        });
+      "
+
+.rf-gate-oidc:
+  extends: .rf-gate
+  id_tokens:
+    RF_ID_TOKEN:
+      aud: $RF_OIDC_AUDIENCE

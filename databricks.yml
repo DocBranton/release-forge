@@ -1,0 +1,28 @@
+# Databricks Asset Bundle for Release Forge.
+#   databricks bundle deploy -t dev && databricks bundle run release_forge -t dev
+bundle:
+  name: release-forge
+
+variables:
+  postgres_branch:
+    description: Lakebase branch resource name
+    default: projects/release-forge/branches/production
+  postgres_database:
+    description: Lakebase database resource name
+    default: projects/release-forge/branches/production/databases/databricks-postgres
+  gitlab_secret_scope:
+    description: Secret scope holding the GitLab read_api token
+    default: release-forge
+  gitlab_secret_key:
+    description: Key of the GitLab token in that scope
+    default: gitlab-token
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production
